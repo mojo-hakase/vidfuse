@@ -1,0 +1,3 @@
+[submodule "cppfuse"]
+	path = cppfuse
+	url = https://gitlab.tubit.tu-berlin.de/cppfuse/cppfuse.git
