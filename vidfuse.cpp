@@ -307,6 +307,12 @@ private:
 		}
 
 		encoder = avcodec_find_encoder_by_name("nvenc");
+		if (!encoder) {
+			av_log(NULL, AV_LOG_ERROR, "Failed to open nvidia encoder for stream #%u: %s\n", i, av_err2str(ret));
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
 		AVDictionary *codecOptions = NULL;
 		encCtx->height = decCtx->height;
 		encCtx->width = decCtx->width;
@@ -557,6 +563,7 @@ private:
 	unsigned int subsStreamNum;
 	static const unsigned int NO_STREAM = -1;
 	std::vector<FilterContext> filter;
+
 	std::unique_ptr<unsigned char[]> smallBuffer;
 	static const int smallBufferSize = 100*1024;
 	std::unique_ptr<unsigned char[]> bigBuffer;
