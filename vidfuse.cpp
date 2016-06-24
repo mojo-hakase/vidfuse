@@ -41,7 +41,7 @@ struct VidParams {
 	std::string filepath;
 	std::string fullpath;
 
-	VidParams() : bitrate(1500), hardsubbing(true), scaling(true), scaleMaxWidth(1280), dumpsize(0) {}
+	VidParams() : bitrate(1500), hardsubbing(true), scaling(true), scaleMaxWidth(960), dumpsize(0) {}
 };
 
 
@@ -100,8 +100,9 @@ public:
 //		if (offset < writeBufferPos && (size + offset) > writeBufferPos)
 //			size = writeBufferPos - offset;
 		std::unique_lock<std::mutex> lk(bufferMutex);
-		bufferSignal.wait(lk, [&]{return ((size + offset) <= this->writeBufferPos);});
+		bufferSignal.wait(lk, [&]{return ((size + offset) <= this->writeBufferPos) || !this->isEncoding;});
 		//av_log(NULL, AV_LOG_ERROR, "Transcoder::read(%p, %lu, %ld)\n", buf, size, offset);
+		size = std::min(size, (size_t)(writeBufferPos - offset));
 		std::memcpy(buf, bigBuffer.get() + offset, size);
 		return size;
 	}
@@ -277,6 +278,10 @@ private:
 			subsStreamNum = subsStreamCount++;
 			muxStream[i] = false;
 			break;
+		case AVMEDIA_TYPE_ATTACHMENT:
+			if (!params->hardsubbing)
+				muxStream[i] = true;
+			break;
 		default:
 			transStream[i] = false;
 			muxStream[i] = false;
@@ -295,8 +300,11 @@ private:
 		AVCodec *encoder;
 		int ret;
 	
-		//transStream[i] = false;
-		//return;
+		if (type != AVMEDIA_TYPE_VIDEO) {
+			transStream[i] = false;
+			return;
+		}
+
 		AVCodec *decoder = avcodec_find_decoder(id);
 		ret = avcodec_open2(decCtx, decoder, NULL);
 		if (ret < 0) {
@@ -327,8 +335,10 @@ private:
 		ret = av_dict_set(&codecOptions, "profile", "high", 0);
 		ret = av_dict_set(&codecOptions, "preset", "llhq", 0);
 		ret = av_dict_set(&codecOptions, "twopass", "1", 0);
-		encCtx->qmin = 15;
-		encCtx->qmax = 18;
+		ret = av_dict_set(&codecOptions, "cbr", "1", 0);
+		encCtx->bit_rate = params->bitrate;
+		//encCtx->qmin = 15;
+		//encCtx->qmax = 18;
 		ret = avcodec_open2(encCtx, encoder, &codecOptions);
 		if (ret < 0) {
 			av_log(NULL, AV_LOG_ERROR, "Cannot open video encoder for stream #%u\n", i);
@@ -413,7 +423,7 @@ private:
 		AVFilterContext *prev = filter[o].bufferSrcCtx;
 		AVFilterContext *next = NULL;
 		while (next != filter[o].bufferSinkCtx) {
-			if (prev == filter[o].bufferSrcCtx && params->hardsubbing)
+			if (prev == filter[o].bufferSrcCtx && params->hardsubbing && subsStreamIndex != NO_STREAM)
 				next = subfilterCtx;
 			else if(prev != scaleCtx && params->scaling)
 				next = scaleCtx;
@@ -473,6 +483,7 @@ private:
 				av_packet_rescale_ts(&packet,
 					ifmtCtx->streams[inStreamIdx]->time_base,
 					ofmtCtx->streams[outStreamIdx]->time_base);
+				packet.stream_index = outStreamIdx;
 				ret = av_interleaved_write_frame(ofmtCtx, &packet);
 				if (ret < 0)
 					break;
@@ -531,6 +542,7 @@ private:
 		}
 		av_packet_unref(&packet);
 		isEncoding = false;
+		bufferSignal.notify_one();
 
 		if (ret < 0) {
 			av_log(NULL, AV_LOG_ERROR, "Error while encoding: %s\n", av_err2str(ret)); 
@@ -788,13 +800,53 @@ public:
 	}
 };
 
+class OptNode : public VidNode {
+	typedef std::function<void(VidParams*)> optSetFunc;
+	std::map<std::string,optSetFunc> myOptions;
+public:
+	OptNode(VidGraph *g, uid_t uid, gid_t gid) : VidNode(g, uid, gid) {
+		myOptions["harsubbed"] = [](VidParams* p){p->hardsubbing = true;};
+		myOptions["softsubbed"] = [](VidParams* p){p->hardsubbing = false;};
+	}
+
+	std::pair<bool,IVidNode*> getNextNode(VidPath &path) {
+		if (path.isEnd())
+			return std::pair<bool,IVidNode*>(false, this);
+		std::string part(*path);
+		auto it = myOptions.find(*path);
+		if (it == myOptions.end())
+			return VidNode::getNextNode(path);
+		it->second(path.data.get());
+		path++;
+		return std::pair<bool,IVidNode*>(true, this);
+	}
+
+	int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+		VidNode::readdir(path, buf, filler, offset, fi);
+		size_t i = subnodes.size();
+		auto it = myOptions.begin();
+		for (; i < offset && it != myOptions.end(); ++i)
+			++it;
+
+		struct stat stats;
+		VidPath &vpath = *(VidPath*)fi->fh;
+		this->getattr(vpath, &stats);
+		for (; it != myOptions.end(); ++it) {
+			if (filler(buf, it->first.c_str(), &stats, ++i))
+				return 0;
+		}
+		return 0;
+	}
+};
+
 class VidFuse : public VidGraph {
 	VidFilesNode *filesnode;
 public:
 	VidFuse(const char *rootpath = "/") {
 		//this->root = this->registerNewNode(new VidRootNode(this));
 		VidNode *vidroot = new VidNode(this, 1000, 1000);
-		VidNode *optnode = new VidNode(this, 1000, 1000);
+		//VidNode *optnode = new VidNode(this, 1000, 1000);
+		OptNode *optnode = new OptNode(this, 1000, 1000);
 		filesnode = new VidFilesNode(this, rootpath);
 		vidroot->registerNewNode("files", filesnode);
 		vidroot->registerNewNode("options", optnode);
