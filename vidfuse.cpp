@@ -44,6 +44,8 @@ struct VidParams {
 	VidParams() : bitrate(1500), hardsubbing(true), scaling(true), scaleMaxWidth(960), dumpsize(0) {}
 };
 
+typedef std::shared_ptr<VidParams> VidParamsPtr;
+
 
 class TranscoderError : public std::exception {
 public:
@@ -249,8 +251,8 @@ private:
 		AVStream           *stream = ifmtCtx->streams[i];
 		AVCodecContext  *codec_ctx = stream->codec;
 		AVMediaType           type = codec_ctx->codec_type;
-		AVCodecID               id = codec_ctx->codec_id;
-		int                profile = codec_ctx->profile;
+	//	AVCodecID               id = codec_ctx->codec_id;
+	//	int                profile = codec_ctx->profile;
 
 		switch (type) {
 		case AVMEDIA_TYPE_VIDEO:
@@ -622,7 +624,7 @@ public:
 		trans.setBaseDir(baseDir);
 	}
 
-	std::pair<bool,IFuseNode*> getNextNode(VidPath &path) {
+	std::pair<bool,IFuseNode*> getNextNode(VidPath &path, const fuseFunctionSelection &purpose) {
 		VidPath end = path.end();
 		std::string subpath = path.to(end);
 		int res = trans.access(subpath.c_str(), F_OK);
@@ -738,7 +740,7 @@ class VidBitrateNode : public VidNode {
 public:
 	VidBitrateNode(IVidGraph *graph, VidNode *optNode) : VidNode(graph, 1000, 1000), optNode(optNode) {}
 
-	std::pair<bool,IVidNode*> getNextNode(VidPath &path) {
+	std::pair<bool,IVidNode*> getNextNode(VidPath &path, const fuseFunctionSelection &purpose) {
 		if (path.isEnd())
 			return std::pair<bool,IVidNode*>(false, this);
 		// parse bitrate
@@ -772,7 +774,7 @@ class SpeedTestNode : public IVidNode, public FuseFDCallback {
 public:
 	SpeedTestNode(IVidGraph *graph) : IVidNode(graph) {}
 
-	std::pair<bool,IVidNode*> getNextNode(VidPath &path) {
+	std::pair<bool,IVidNode*> getNextNode(VidPath &path, const fuseFunctionSelection &purpose) {
 		if (path.isEnd())
 			return std::pair<bool,IVidNode*>(false, this);
 		return std::pair<bool,IVidNode*>(false,nullptr);
@@ -800,40 +802,61 @@ public:
 	}
 };
 
-class OptNode : public VidNode {
-	typedef std::function<void(VidParams*)> optSetFunc;
+class VidOptNode : public VidNode {
+	typedef std::function<void(VidParamsPtr)> optSetFunc;
 	std::map<std::string,optSetFunc> myOptions;
+	typedef std::vector<std::string> strVector;
+	typedef std::function<strVector(VidParamsPtr)> optListFunc;
+	std::vector<optListFunc> listOptions;
 public:
-	OptNode(VidGraph *g, uid_t uid, gid_t gid) : VidNode(g, uid, gid) {
-		myOptions["harsubbed"] = [](VidParams* p){p->hardsubbing = true;};
-		myOptions["softsubbed"] = [](VidParams* p){p->hardsubbing = false;};
+	VidOptNode(VidGraph *g, uid_t uid, gid_t gid) : VidNode(g, uid, gid) {
+		myOptions["harsubbed"] = [](VidParamsPtr p){p->hardsubbing = true;};
+		myOptions["softsubbed"] = [](VidParamsPtr p){p->hardsubbing = false;};
+		listOptions.push_back([](VidParamsPtr p) {
+			if (p->hardsubbing)
+				return strVector({"softsubbed"});
+			else
+				return strVector({"harsubbed"});
+		});
 	}
 
-	std::pair<bool,IVidNode*> getNextNode(VidPath &path) {
+	std::pair<bool,IVidNode*> getNextNode(VidPath &path, const fuseFunctionSelection &purpose) {
 		if (path.isEnd())
 			return std::pair<bool,IVidNode*>(false, this);
 		std::string part(*path);
 		auto it = myOptions.find(*path);
 		if (it == myOptions.end())
-			return VidNode::getNextNode(path);
-		it->second(path.data.get());
+			return VidNode::getNextNode(path, purpose);
+		it->second(path.data);
 		path++;
 		return std::pair<bool,IVidNode*>(true, this);
 	}
 
 	int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
-		VidNode::readdir(path, buf, filler, offset, fi);
-		size_t i = subnodes.size();
-		auto it = myOptions.begin();
-		for (; i < offset && it != myOptions.end(); ++i)
-			++it;
-
 		struct stat stats;
-		VidPath &vpath = *(VidPath*)fi->fh;
-		this->getattr(vpath, &stats);
-		for (; it != myOptions.end(); ++it) {
-			if (filler(buf, it->first.c_str(), &stats, ++i))
-				return 0;
+		struct stat *statbuf = &stats;
+		VidPath &vpath = *((VidPath*)fi->fh);
+		if (offset < (int)subnodes.size()) {
+			auto it = subnodes.begin();
+			for (int i = 0; i < offset && it != subnodes.end(); ++i)
+				++it;
+
+			for (; it != subnodes.end(); ++it) {
+				it->second->getattr(vpath, statbuf);
+				if (filler(buf, it->first.c_str(), statbuf, ++offset))
+					return 0;
+			}
+		}
+		this->getattr(vpath, statbuf);
+		int num = subnodes.size();
+		for (auto it = listOptions.begin(); it != listOptions.end(); ++it) {
+			auto vec = (*it)(vpath.data);
+			for (auto en = vec.begin(); en != vec.end(); ++en) {
+				num++;
+				if (offset < num)
+					if (filler(buf, en->c_str(), statbuf, ++offset))
+						return 0;
+			}
 		}
 		return 0;
 	}
@@ -842,11 +865,11 @@ public:
 class VidFuse : public VidGraph {
 	VidFilesNode *filesnode;
 public:
-	VidFuse(const char *rootpath = "/") {
+	VidFuse(const char *rootpath = "/") : VidGraph(FS_FUNC_READONLY) {
 		//this->root = this->registerNewNode(new VidRootNode(this));
 		VidNode *vidroot = new VidNode(this, 1000, 1000);
 		//VidNode *optnode = new VidNode(this, 1000, 1000);
-		OptNode *optnode = new OptNode(this, 1000, 1000);
+		VidOptNode *optnode = new VidOptNode(this, 1000, 1000);
 		filesnode = new VidFilesNode(this, rootpath);
 		vidroot->registerNewNode("files", filesnode);
 		vidroot->registerNewNode("options", optnode);
