@@ -26,11 +26,14 @@ extern "C" {
 	AV_ERROR_MAX_STRING_SIZE, errnum) 
 }
 
+//#include "vidfuse.hpp"
+
 template<typename T>
 using deleted_unique_ptr = std::unique_ptr<T,std::function<void(T*)>>;
 
 struct VidParams {
 	unsigned int bitrate;
+	unsigned int audioBitrate;
 	bool hardsubbing;
 	bool scaling;
 	int scaleMode;
@@ -41,7 +44,7 @@ struct VidParams {
 	std::string filepath;
 	std::string fullpath;
 
-	VidParams() : bitrate(1500), hardsubbing(true), scaling(true), scaleMaxWidth(960), dumpsize(0) {}
+	VidParams() : bitrate(1500), audioBitrate(131072), hardsubbing(true), scaling(true), scaleMaxWidth(960), dumpsize(0) {}
 };
 
 typedef std::shared_ptr<VidParams> VidParamsPtr;
@@ -265,7 +268,7 @@ private:
 		case AVMEDIA_TYPE_AUDIO:
 			transStream[i] = true;
 			muxStream[i] = true;
-			transStream[i] = false; // as long as i cannot transcode audio
+			//transStream[i] = false; // as long as i cannot transcode audio
 			//muxStream[i] = false;
 			break;
 		case AVMEDIA_TYPE_SUBTITLE:
@@ -291,6 +294,163 @@ private:
 	}
 
 	void initStreamTranscode(unsigned int index) {
+		AVStream           *istream = ifmtCtx->streams[index];
+		AVCodecContext      *decCtx = istream->codec;
+		AVMediaType            type = decCtx->codec_type;
+		switch (type) {
+		case AVMEDIA_TYPE_VIDEO:
+			initVideoTranscode(index);
+			break;
+		case AVMEDIA_TYPE_AUDIO:
+			initAudioTranscode(index);
+			break;
+		default:
+			av_log(NULL, AV_LOG_ERROR, "Unable to transcode stream of type %d\n", type);
+			break;
+		}
+	}
+
+	void initAudioTranscode(unsigned int index) {
+		unsigned int i = index;
+		unsigned int o = mappedStream[i];
+		AVStream           *istream = ifmtCtx->streams[i];
+		AVCodecContext      *decCtx = istream->codec;
+		AVMediaType            type = decCtx->codec_type;
+		AVCodecID                id = decCtx->codec_id;
+		AVStream           *ostream = ofmtCtx->streams[o];
+		AVCodecContext      *encCtx = ostream->codec;
+		AVCodec *encoder;
+		int ret;
+
+		transStream[i] = false;
+
+		AVCodec *decoder = avcodec_find_decoder(id);
+		ret = avcodec_open2(decCtx, decoder, NULL);
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Failed to open decoder for stream #%u: %s\n", i, av_err2str(ret));
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		encoder = avcodec_find_encoder_by_name("libfdk_aac");
+		if (!encoder) {
+			encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
+			if (!encoder) {
+				av_log(NULL, AV_LOG_ERROR, "Failed to open AAC encoder for stream #%u: %s\n", i, av_err2str(ret));
+				transStream[i] = false;
+				muxStream[i] = true;
+				return;
+			}
+		}
+
+		encCtx->channels = 2;
+		encCtx->channels = decCtx->channels;
+		encCtx->channel_layout = av_get_default_channel_layout(encCtx->channels);
+		encCtx->sample_rate = decCtx->sample_rate;
+		encCtx->sample_fmt = encoder->sample_fmts[0];
+		encCtx->bit_rate = params->audioBitrate;
+
+		ostream->time_base.den = decCtx->sample_rate;
+		ostream->time_base.num = 1;
+
+		ret = avcodec_open2(encCtx, encoder, NULL);
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Cannot open audio encoder for stream #%u\n", i);
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		char args[512];
+		AVFilter *bufferSrc   = avfilter_get_by_name("abuffer");
+		AVFilter *bufferSink  = avfilter_get_by_name("abuffersink");
+		AVFilter *setnsamplesFilt = avfilter_get_by_name("asetnsamples");
+		AVFilterContext *setnsamplesCtx = NULL;
+		deleted_unique_ptr<AVFilterInOut>
+			outputs(avfilter_inout_alloc(), [&](AVFilterInOut*f){avfilter_inout_free(&f);}),
+			inputs(avfilter_inout_alloc(), [&](AVFilterInOut*f){avfilter_inout_free(&f);});
+		filter[o].filterGraph.reset(avfilter_graph_alloc());
+
+		snprintf(args, sizeof(args),
+				"time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%lx",
+				decCtx->time_base.num, decCtx->time_base.den, decCtx->sample_rate,
+				av_get_sample_fmt_name(decCtx->sample_fmt), decCtx->channel_layout);
+		ret = avfilter_graph_create_filter(&filter[o].bufferSrcCtx, bufferSrc, "in",
+				args, NULL, filter[o].filterGraph.get());
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source\n");
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		snprintf(args, sizeof(args),
+				"n=%d:p=1",
+				encCtx->frame_size);
+		ret = avfilter_graph_create_filter(&setnsamplesCtx, setnsamplesFilt, "buffer",
+				args, NULL, filter[o].filterGraph.get());
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Cannot create 'setnsamples' filter\n");
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		ret = avfilter_graph_create_filter(&filter[o].bufferSinkCtx, bufferSink, "out",
+				NULL, NULL, filter[o].filterGraph.get());
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Cannot create buffer sink\n");
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		ret = av_opt_set_bin(filter[o].bufferSinkCtx, "sample_fmts",
+				(uint8_t*)&encCtx->sample_fmt, sizeof(encCtx->sample_fmt),
+				AV_OPT_SEARCH_CHILDREN);
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Cannot set output sample format\n");
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		ret = avfilter_link(filter[o].bufferSrcCtx, 0, setnsamplesCtx, 0);
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Cannot link filter\n");
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+		ret = avfilter_link(setnsamplesCtx, 0, filter[o].bufferSinkCtx, 0);
+		if (ret < 0) {
+			av_log(NULL, AV_LOG_ERROR, "Cannot link filter\n");
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		/* Endpoints for the filter graph. */
+		outputs->name       = av_strdup("in");
+		outputs->filter_ctx  = filter[o].bufferSrcCtx;
+		outputs->pad_idx    = 0;
+		outputs->next       = NULL;
+
+		inputs->name        = av_strdup("out");
+		inputs->filter_ctx  = filter[o].bufferSinkCtx;
+		inputs->pad_idx     = 0;
+		inputs->next        = NULL;
+		if ((ret = avfilter_graph_config(filter[o].filterGraph.get(), NULL)) < 0) {
+			transStream[i] = false;
+			muxStream[i] = true;
+			return;
+		}
+
+		transStream[i] = true;
+	}
+
+	void initVideoTranscode(unsigned int index) {
 		unsigned int i = index;
 		unsigned int o = mappedStream[i];
 		AVStream           *istream = ifmtCtx->streams[i];
@@ -338,7 +498,7 @@ private:
 		ret = av_dict_set(&codecOptions, "preset", "llhq", 0);
 		ret = av_dict_set(&codecOptions, "twopass", "1", 0);
 		ret = av_dict_set(&codecOptions, "cbr", "1", 0);
-		encCtx->bit_rate = params->bitrate;
+		encCtx->bit_rate = params->bitrate * 2;
 		//encCtx->qmin = 15;
 		//encCtx->qmax = 18;
 		ret = avcodec_open2(encCtx, encoder, &codecOptions);
@@ -486,6 +646,10 @@ private:
 					ifmtCtx->streams[inStreamIdx]->time_base,
 					ofmtCtx->streams[outStreamIdx]->time_base);
 				packet.stream_index = outStreamIdx;
+				//packet.pos = 0;
+				if (packet.dts < 0)
+					packet.dts = 0;
+				//av_log(NULL, AV_LOG_ERROR, "remux packet: stream(%i), pts(%li), dts(%li), pos(%li), duration(%li)\n", outStreamIdx, packet.pts, packet.dts, packet.pos, packet.duration);
 				ret = av_interleaved_write_frame(ofmtCtx, &packet);
 				if (ret < 0)
 					break;
@@ -640,7 +804,9 @@ public:
 
 	int getattr(VidPath path, struct stat *statbuf) {
 		cout << path.data->filepath.c_str() << endl;
-		return trans.getattr(path.data->filepath.c_str(), statbuf);
+		int result = trans.getattr(path.data->filepath.c_str(), statbuf);
+		statbuf->st_size = 100*1024*1024;
+		return result;
 	}
 
 	int readlink(VidPath path, char *link, size_t size) {
@@ -688,7 +854,7 @@ public:
 	int fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *fi) {
 		Transcoder &tr = *(Transcoder*)fi->fh;
 		int result = trans.getattr(tr.getParams()->filepath.c_str(), statbuf);
-		//statbuf->st_size = 100;
+		statbuf->st_size = 100*1024*1024;
 		return result;
 	}
 };
