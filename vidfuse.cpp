@@ -83,6 +83,7 @@ public:
 		  transStream(),
 		  muxStream(),
 		  videoStreamIndex(NO_STREAM),
+		  audioStreamIndex(NO_STREAM),
 		  subsStreamIndex(NO_STREAM)
 	{
 		initEncoding();
@@ -150,6 +151,7 @@ private:
 
 	void initEncoding() {
 		int ret;
+		size_t outStreamCount = 0;
 
 		cout << params->fullpath.c_str() << endl;
 		if ((ret = avformat_open_input(&ifmtCtx, params->fullpath.c_str(), NULL, NULL)) < 0)
@@ -168,11 +170,10 @@ private:
 		muxStream.assign(ifmtCtx->nb_streams, false);
 		mappedStream.assign(ifmtCtx->nb_streams, NO_STREAM);
 		videoStreamIndex = NO_STREAM;
+		audioStreamIndex = NO_STREAM;
 		subsStreamIndex = NO_STREAM;
 		subsStreamCount = 0;
 		subsStreamNum = NO_STREAM;
-
-		size_t outStreamCount = 0;
 
 		for (unsigned int i = 0; i < ifmtCtx->nb_streams; i++) {
 			analyseStream(i);
@@ -192,6 +193,7 @@ private:
 
 		avformat_alloc_output_context2(&ofmtCtx, NULL, "Matroska", NULL);
 		//avformat_alloc_output_context2(&ofmtCtx, NULL, NULL, ".mp4");
+		//avformat_alloc_output_context2(&ofmtCtx, NULL, "ismv", NULL);
 		if (!ofmtCtx) {
 			av_log(NULL, AV_LOG_ERROR, "Could not create output context\n");
 			throw TranscoderError(AVERROR_UNKNOWN);
@@ -266,6 +268,9 @@ private:
 			muxStream[i] = true;
 			break;
 		case AVMEDIA_TYPE_AUDIO:
+			if (audioStreamIndex != NO_STREAM)
+				break;
+			audioStreamIndex = i;
 			transStream[i] = true;
 			muxStream[i] = true;
 			//transStream[i] = false; // as long as i cannot transcode audio
@@ -284,10 +289,10 @@ private:
 			muxStream[i] = false;
 			break;
 		case AVMEDIA_TYPE_ATTACHMENT:
+		default:
 			if (!params->hardsubbing)
 				muxStream[i] = true;
 			break;
-		default:
 			transStream[i] = false;
 			muxStream[i] = false;
 		}
@@ -334,6 +339,7 @@ private:
 		}
 
 		encoder = avcodec_find_encoder_by_name("libfdk_aac");
+		encoder = NULL;
 		if (!encoder) {
 			encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
 			if (!encoder) {
@@ -492,6 +498,8 @@ private:
 				encCtx->width = params->scaleMaxWidth;
 			encCtx->height = decCtx->height * encCtx->width / decCtx->width;
 		}
+		encCtx->height &= ~3;
+		encCtx->width &= ~3;
 		encCtx->pix_fmt = encoder->pix_fmts[0];
 		encCtx->time_base = decCtx->time_base;
 		ret = av_dict_set(&codecOptions, "profile", "high", 0);
@@ -538,7 +546,8 @@ private:
 			return;
 		}
 
-		if (params->scaling) {
+		//if (params->scaling) {
+		if (encCtx->width != decCtx->width || encCtx->height != decCtx->height) {
 			snprintf(args, sizeof(args),
 					"w=%d:h=%d:flags=lanczos",
 					encCtx->width, encCtx->height);
@@ -549,6 +558,8 @@ private:
 				encCtx->width = decCtx->width;
 				encCtx->height = decCtx->height;
 			}
+		} else {
+			params->scaling = false;
 		}
 
 		if (params->hardsubbing && subsStreamIndex != NO_STREAM) {
@@ -587,7 +598,7 @@ private:
 		while (next != filter[o].bufferSinkCtx) {
 			if (prev == filter[o].bufferSrcCtx && params->hardsubbing && subsStreamIndex != NO_STREAM)
 				next = subfilterCtx;
-			else if(prev != scaleCtx && params->scaling)
+			else if(prev != scaleCtx && params->scaling && scaleCtx)
 				next = scaleCtx;
 			else
 				next = filter[o].bufferSinkCtx;
@@ -736,6 +747,7 @@ private:
 	std::vector<bool> muxStream;
 	std::vector<int> mappedStream;
 	unsigned int videoStreamIndex;
+	unsigned int audioStreamIndex;
 	unsigned int subsStreamIndex;
 	unsigned int subsStreamCount;
 	unsigned int subsStreamNum;
@@ -743,9 +755,11 @@ private:
 	std::vector<FilterContext> filter;
 
 	std::unique_ptr<unsigned char[]> smallBuffer;
-	static const int smallBufferSize = 100*1024;
+	static const int smallBufferSize = 400*1024;
 	std::unique_ptr<unsigned char[]> bigBuffer;
+public:
 	static const int bigBufferSize = 100*1024*1024;
+private:
 	size_t writeBufferPos;
 	size_t lastReadPos;
 
@@ -805,7 +819,7 @@ public:
 	int getattr(VidPath path, struct stat *statbuf) {
 		cout << path.data->filepath.c_str() << endl;
 		int result = trans.getattr(path.data->filepath.c_str(), statbuf);
-		statbuf->st_size = 100*1024*1024;
+		statbuf->st_size = Transcoder::bigBufferSize;
 		return result;
 	}
 
@@ -854,7 +868,7 @@ public:
 	int fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *fi) {
 		Transcoder &tr = *(Transcoder*)fi->fh;
 		int result = trans.getattr(tr.getParams()->filepath.c_str(), statbuf);
-		statbuf->st_size = 100*1024*1024;
+		statbuf->st_size = Transcoder::bigBufferSize;
 		return result;
 	}
 };
@@ -901,36 +915,40 @@ public:
 	}
 };
 
-class VidBitrateNode : public VidNode {
-	VidNode *optNode;
+template <typename uint_t = unsigned int>
+class UIntParserNode : public VidNode {
+	IVidNode *nextNode;
+	uint_t VidParams::* parseParam;
+	vector<uint_t> sug;
 public:
-	VidBitrateNode(IVidGraph *graph, VidNode *optNode) : VidNode(graph, 1000, 1000), optNode(optNode) {}
+	UIntParserNode(IVidGraph *graph, IVidNode *nextNode, uint_t VidParams::* parseParam) : VidNode(graph, 1000, 1000), nextNode(nextNode), parseParam(parseParam) {}
+	UIntParserNode(IVidGraph *graph, IVidNode *nextNode, uint_t VidParams::* parseParam, const std::vector<uint_t> &suggestions) : VidNode(graph, 1000, 1000), nextNode(nextNode), parseParam(parseParam), sug(suggestions) {}
+	UIntParserNode(IVidGraph *graph, IVidNode *nextNode, uint_t VidParams::* parseParam, std::vector<uint_t> &&suggestions) : VidNode(graph, 1000, 1000), nextNode(nextNode), parseParam(parseParam), sug(suggestions) {}
 
 	std::pair<bool,IVidNode*> getNextNode(VidPath &path, const fuseFunctionSelection &purpose) {
 		if (path.isEnd())
 			return std::pair<bool,IVidNode*>(false, this);
-		// parse bitrate
-		unsigned int bitrate = 0;
+		// parse int
+		uint_t parsed = 0;
 		for (const char *c = *path; *c; ++c) {
 			if (*c < '0' || *c > '9')
 				return std::pair<bool,IVidNode*>(false,nullptr);
-			bitrate = bitrate * 10 + (*c - '0');
+			parsed = parsed * 10 + (*c - '0');
 		}
-		path.data->bitrate = bitrate;
+		path.data.get()->*parseParam = parsed;
 		++path;
-		return std::pair<bool,IVidNode*>(true,optNode);
+		return std::pair<bool,IVidNode*>(true,nextNode);
 	}
 
 	int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
 		struct stat stats, *statbuf = nullptr;
-		if (0 == optNode->getattr(PathSplitter::New("")->begin<VidParams>(), &stats))
+		if (0 == nextNode->getattr(PathSplitter::New("")->begin<VidParams>(), &stats))
 			statbuf = &stats;
-		const char *bitrates[] = {"00240", "00800", "01200", "02000", "04000", "08000", "11650"};
-		while (offset < 7) {
-			cout << offset << endl;
-			if (filler(buf, bitrates[offset], statbuf, offset + 1))
+		for (auto it = sug.begin() + offset; it != sug.end(); ++it) {
+			std::stringstream ss;
+			ss << *it;
+			if (filler(buf, ss.str().c_str(), statbuf, ++offset))
 				return 0;
-			++offset;
 		}
 		return 0;
 	}
@@ -1039,7 +1057,8 @@ public:
 		filesnode = new VidFilesNode(this, rootpath);
 		vidroot->registerNewNode("files", filesnode);
 		vidroot->registerNewNode("options", optnode);
-		optnode->registerNewNode("bitrate", new VidBitrateNode(this, optnode));
+		optnode->registerNewNode("video_bitrate", new UIntParserNode<>(this, optnode, &VidParams::bitrate, {10*1024*8, 50*1024*8, 100*1024*8, 512*1024*8, 1024*1024*8, 2*1024*1024*8, 4*1024*1024*8, 6*1024*1024*8}));
+		optnode->registerNewNode("audio_bitrate", new UIntParserNode<>(this, optnode, &VidParams::audioBitrate, {16*1024, 32*1024, 64*1024, 128*1024, 240*1024, 320*1024}));
 		optnode->registerNewNode("dump", new VidParamDumpNode(this));
 		optnode->addExistingNode("files", filesnode);
 		vidroot->registerNewNode("speedtest", new SpeedTestNode(this));
